@@ -35,10 +35,20 @@ export interface WireSystemMessage {
   content: string
 }
 
-/** User-role message: a single string of user input. */
+/**
+ * One content part of a multimodal user message (OpenAI-compatible vision
+ * vocabulary). Text rides as a `text` part and each image as an `image_url`
+ * part carrying a base64 `data:` URL; the provider accepts JPEG, PNG, GIF,
+ * and WebP, judged by actual bytes rather than the declared MIME type.
+ */
+export type WireUserContentPart =
+  | { type: 'text'; text: string }
+  | { type: 'image_url'; image_url: { url: string } }
+
+/** User-role message: a single string of user input, or a part array when images are present. */
 export interface WireUserMessage {
   role: 'user'
-  content: string
+  content: string | WireUserContentPart[]
 }
 
 /** Tool-role message: the result of one tool call, keyed by its call id. */

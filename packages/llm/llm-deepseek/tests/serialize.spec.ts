@@ -1,8 +1,9 @@
 import { describe, expect, it } from 'vitest'
 import { AttachmentId } from '@deepseek-ai/dsh-attachment'
+import type { AttachmentStore } from '@deepseek-ai/dsh-attachment'
 import { createUserMessage, CallId, ReasoningEffortId, createMessage } from '@deepseek-ai/dsh-llm'
 import type { ContentBlock, GenerateOptions, Message } from '@deepseek-ai/dsh-llm'
-import { serializeMessages, serializeRequest } from '../src/serialize.ts'
+import { serializeMessages, serializeMessagesWithImages, serializeRequest, serializeRequestWithImages } from '../src/serialize.ts'
 
 function request(overrides: Partial<GenerateOptions> = {}): GenerateOptions {
   return { provider: 'deepseek-official', model: 'deepseek-v4-flash', messages: [], ...overrides }
@@ -301,5 +302,138 @@ describe('review fixes: assistant content shapes', () => {
       source: { kind: 'plugin', plugin: 'test' },
     })])
     expect(wire[0]).toMatchObject({ content: '' })
+  })
+})
+
+describe('serializeMessagesWithImages', () => {
+  const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])
+
+  const attachments = {
+    readImage: async (ref: { mediaType: string }) => ({
+      ref: { ...ref, mediaType: ref.mediaType },
+      data: PNG_BYTES,
+    }),
+  } as unknown as AttachmentStore
+
+  function imageBlock(): ContentBlock {
+    return {
+      type: 'image',
+      attachment: {
+        attachmentId: AttachmentId(`sha256:${'c'.repeat(64)}`),
+        mediaType: 'image/png', bytes: PNG_BYTES.length, width: 1, height: 1,
+      },
+    }
+  }
+
+  it('emits an image_url part array for an image-only user message', async () => {
+    const wire = await serializeMessagesWithImages([
+      createUserMessage({ content: [imageBlock()], source: { kind: 'plugin', plugin: 'test' } }),
+    ], attachments)
+    expect(wire).toEqual([{
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: `data:image/png;base64,${Buffer.from(PNG_BYTES).toString('base64')}` } },
+      ],
+    }])
+  })
+
+  it('keeps text and image parts in order inside one user message', async () => {
+    const wire = await serializeMessagesWithImages([
+      createUserMessage({
+        content: [{ type: 'text', text: '看这张图：' }, imageBlock(), { type: 'text', text: ' 有几行字？' }],
+        source: { kind: 'plugin', plugin: 'test' },
+      }),
+    ], attachments)
+    expect(wire).toEqual([{
+      role: 'user',
+      content: [
+        { type: 'text', text: '看这张图：' },
+        { type: 'image_url', image_url: { url: `data:image/png;base64,${Buffer.from(PNG_BYTES).toString('base64')}` } },
+        { type: 'text', text: ' 有几行字？' },
+      ],
+    }])
+  })
+
+  it('keeps image-free messages on the plain string shape', async () => {
+    const wire = await serializeMessagesWithImages([
+      createUserMessage({ content: [{ type: 'text', text: 'hi' }], source: { kind: 'plugin', plugin: 'test' } }),
+      createUserMessage({ content: [imageBlock()], source: { kind: 'plugin', plugin: 'test' } }),
+    ], attachments)
+    expect(wire[0]).toEqual({ role: 'user', content: 'hi' })
+    expect(wire[1]).toMatchObject({ role: 'user' })
+    expect((wire[1] as { content: unknown[] }).content).toHaveLength(1)
+  })
+
+  it('rejects images in system and assistant messages', async () => {
+    await expect(serializeMessagesWithImages([
+      createMessage({ role: 'system', content: [imageBlock()], source: { kind: 'plugin', plugin: 'test' } }),
+    ], attachments)).rejects.toThrow(expect.objectContaining({ code: 'UNSUPPORTED_CONTENT' }))
+    await expect(serializeMessagesWithImages([
+      createMessage({ role: 'assistant', content: [imageBlock()], source: { kind: 'plugin', plugin: 'test' } }),
+    ], attachments)).rejects.toThrow(expect.objectContaining({ code: 'UNSUPPORTED_CONTENT' }))
+  })
+
+  it('rejects images nested inside tool results (role:tool is text-only on the wire)', async () => {
+    await expect(serializeMessagesWithImages([
+      createUserMessage({
+        content: [{
+          type: 'tool-result',
+          toolCallId: CallId('call-1'),
+          content: [imageBlock()],
+        }],
+        source: { kind: 'plugin', plugin: 'test' },
+      }),
+    ], attachments)).rejects.toThrow(expect.objectContaining({ code: 'UNSUPPORTED_CONTENT' }))
+  })
+
+  it('still expands tool results beside an image-bearing user message', async () => {
+    const wire = await serializeMessagesWithImages([
+      createUserMessage({
+        content: [
+          imageBlock(),
+          { type: 'tool-result', toolCallId: CallId('call-1'), content: [{ type: 'text', text: 'ok' }] },
+        ],
+        source: { kind: 'plugin', plugin: 'test' },
+      }),
+    ], attachments)
+    expect(wire[1]).toEqual({ role: 'tool', tool_call_id: 'call-1', content: 'ok' })
+  })
+})
+
+describe('serializeRequestWithImages', () => {
+  const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47])
+  const attachments = {
+    readImage: async (ref: { mediaType: string }) => ({
+      ref: { ...ref, mediaType: ref.mediaType },
+      data: PNG_BYTES,
+    }),
+  } as unknown as AttachmentStore
+
+  const history: Message[] = [createUserMessage({
+    content: [{
+      type: 'image',
+      attachment: {
+        attachmentId: AttachmentId(`sha256:${'d'.repeat(64)}`),
+        mediaType: 'image/jpeg', bytes: PNG_BYTES.length, width: 1, height: 1,
+      },
+    }],
+    source: { kind: 'plugin', plugin: 'test' },
+  })]
+
+  it('builds the same request envelope with image parts and a system prompt', async () => {
+    const wire = await serializeRequestWithImages(
+      request({ messages: history, system: 'be visual' }),
+      {},
+      attachments,
+    )
+    expect(wire.model).toBe('deepseek-v4-flash')
+    expect(wire.messages[0]).toEqual({ role: 'system', content: 'be visual' })
+    expect(wire.messages[1]).toEqual({
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${Buffer.from(PNG_BYTES).toString('base64')}` } },
+      ],
+    })
+    expect(wire.stream).toBe(true)
   })
 })

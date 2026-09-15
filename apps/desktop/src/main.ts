@@ -10,9 +10,12 @@ import {
   ipcMain,
   Menu,
   protocol,
+  Tray,
   type IpcMainInvokeEvent,
+  type NativeImage,
 } from 'electron'
 import { resolveDesktopPaths } from './paths.ts'
+import { loadDesktopIcon, loadTrayIcon } from './tray-icon.ts'
 import { DesktopProjectManager, type DesktopProjectHooks } from './project-manager.ts'
 import { DesktopHostProcess } from './host-process.ts'
 import { DesktopBackendController, type DesktopBackendState } from './backend-controller.ts'
@@ -24,7 +27,9 @@ import { desktopErrorState } from './startup-error.ts'
 import { startupFailureDocument } from './startup-document.ts'
 
 const SCHEME = 'dsh-app'
+const APPLICATION_NAME = 'DeepSeek Harness'
 let focusPrimaryWindow = (): void => {}
+let applicationIcon: NativeImage | undefined
 type RecoveryAction = 'restart' | 'plugins' | 'reset'
 let profileRecoveryAvailable = (): boolean => false
 const emergencyPages = new WeakMap<BrowserWindow, { url: string; message: string; busy: boolean }>()
@@ -94,6 +99,7 @@ function createWindow(preload: string, show = false): BrowserWindow {
     minWidth: 880,
     minHeight: 600,
     show,
+    ...(applicationIcon === undefined ? {} : { icon: applicationIcon }),
     webPreferences: {
       preload,
       nodeIntegration: false,
@@ -159,10 +165,16 @@ async function main(): Promise<void> {
   let startup: Promise<void> | undefined
   let mainWindow: BrowserWindow | undefined
   let pluginWindow: BrowserWindow | undefined
+  let tray: Tray | undefined
   let shellInstallerOwnsQuit = false
   let updateState: DesktopUpdateState = { phase: 'idle' }
   const locale = resolveDesktopLocale(app.getLocale())
   const messages = locale.messages
+  applicationIcon = await loadDesktopIcon('icon.png').catch((error: unknown) => {
+    // A missing icon asset must not block startup; Electron then keeps its default application icon.
+    console.error(error)
+    return undefined
+  })
   const appPreload = fileURLToPath(new URL('./preload-app.cjs', import.meta.url))
   const managementPreload = fileURLToPath(new URL('./preload.cjs', import.meta.url))
   const startupUrl = `${SCHEME}://shell/startup.html`
@@ -452,6 +464,12 @@ async function main(): Promise<void> {
   const createMainWindow = (): BrowserWindow => {
     const window = createWindow(appPreload, true)
     mainWindow = window
+    window.on('close', (event) => {
+      // Closing the main window keeps the shell alive in the tray; only the tray Quit item exits.
+      if (quitting || shellInstallerOwnsQuit || tray === undefined) return
+      event.preventDefault()
+      window.hide()
+    })
     window.on('closed', () => { if (mainWindow === window) mainWindow = undefined })
     window.webContents.on('preload-error', (_event, _path, error) => {
       void showEmergencyError(error).catch((failure: unknown) => { console.error(failure) })
@@ -477,10 +495,31 @@ async function main(): Promise<void> {
     window.focus()
   }
 
+  const createTray = async (): Promise<Tray | undefined> => {
+    const image = await loadTrayIcon().catch((error: unknown) => {
+      console.error(error)
+      return undefined
+    })
+    if (image === undefined) return undefined
+    const instance = new Tray(image)
+    instance.setToolTip(APPLICATION_NAME)
+    instance.setContextMenu(Menu.buildFromTemplate([
+      { label: messages.trayOpen, click: () => { focusPrimaryWindow() } },
+      { type: 'separator' },
+      { label: messages.trayQuit, click: () => { app.quit() } },
+    ]))
+    instance.on('click', () => { focusPrimaryWindow() })
+    return instance
+  }
+  tray = await createTray()
+
   app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) focusPrimaryWindow()
+    // A hidden main window still exists, so Dock activation restores it instead of leaving it hidden.
+    if (mainWindow === undefined || !mainWindow.isVisible()) focusPrimaryWindow()
   })
   app.on('window-all-closed', () => {
+    // A live tray owns the application lifetime; without one the shell keeps its exit-on-last-window behavior.
+    if (tray !== undefined) return
     if (process.platform !== 'darwin') app.quit()
   })
   app.on('before-quit', (event) => {
@@ -488,6 +527,10 @@ async function main(): Promise<void> {
     event.preventDefault()
     quitting = true
     void backend.close().catch((error: unknown) => { console.error(error) }).finally(() => { app.quit() })
+  })
+  app.on('will-quit', () => {
+    tray?.destroy()
+    tray = undefined
   })
 
   mainWindow = createMainWindow()

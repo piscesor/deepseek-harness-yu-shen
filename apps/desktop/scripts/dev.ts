@@ -4,6 +4,7 @@ import { spawn } from 'node:child_process'
 import { existsSync, readFileSync } from 'node:fs'
 import { createRequire } from 'node:module'
 import { join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
 import { parseArgs } from 'node:util'
 import { DESKTOP_HOST_PROTOCOL_VERSION } from '../src/host-protocol.ts'
 import type { DesktopRelease } from '../src/release.ts'
@@ -51,6 +52,23 @@ async function runPackageScript(script: string, cwd: string): Promise<void> {
     throw new Error('desktop development: invoke this launcher through pnpm run dev:desktop or start:desktop')
   }
   await run(process.execPath, [packageManager, 'run', script], cwd)
+}
+
+/**
+ * Apply an explicitly opted-in local development overlay after the disposable
+ * Desktop project is generated. This is intentionally development-only: a
+ * packaged Desktop build continues to own an isolated, signed plugin profile.
+ */
+async function applyDevelopmentProjectOverlay(projectDir: string): Promise<void> {
+  const overlayPath = process.env.DSH_DESKTOP_DEV_PROJECT_OVERLAY
+  if (overlayPath === undefined || overlayPath === '') return
+  console.log(`desktop development: applying project overlay ${overlayPath}`)
+  const moduleUrl = pathToFileURL(resolve(overlayPath)).href
+  const overlay = await import(moduleUrl) as { applyDevelopmentProjectOverlay?: (project: string) => void | Promise<void> }
+  if (typeof overlay.applyDevelopmentProjectOverlay !== 'function') {
+    throw new Error('desktop development: DSH_DESKTOP_DEV_PROJECT_OVERLAY must export applyDevelopmentProjectOverlay(projectDir)')
+  }
+  await overlay.applyDevelopmentProjectOverlay(projectDir)
 }
 
 async function launchElectron(): Promise<void> {
@@ -108,6 +126,7 @@ async function main(): Promise<void> {
     dependencyDir: join(REPOSITORY_ROOT, 'node_modules', '.pnpm', 'node_modules'),
     release,
   })
+  await applyDevelopmentProjectOverlay(join(DEVELOPMENT_ROOT, 'project'))
   await launchElectron()
 }
 

@@ -38,7 +38,17 @@ export function TurnUsagePanel({ usage, t }: TurnUsagePanelProps) {
   const routes = usage.routes?.map(route => `${route.provider}/${route.model}`).join(', ') ?? ''
 
   return (
-    <span ref={rootRef} style={{ anchorName }} className={css.root}>
+    <span
+      ref={rootRef}
+      style={{ anchorName }}
+      className={css.root}
+      data-turn-usage
+      data-usage-input={usage.uncachedInputTokens}
+      data-usage-cache-read={usage.cacheReadTokens ?? 0}
+      data-usage-cache-write={usage.cacheWriteTokens ?? 0}
+      data-usage-output={usage.outputTokens}
+      data-usage-routes={routes}
+    >
       <button
         type="button"
         className={css.trigger}

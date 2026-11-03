@@ -11,6 +11,7 @@ import type { CompactionResult, CompactionTrigger } from '@deepseek-ai/dsh-compa
 import type { EpochHeader, Session, SessionSeq } from '@deepseek-ai/dsh-session'
 import type { ProjectionHandle } from '@deepseek-ai/dsh-session-projection'
 import { CONTEXT_WINDOW_EXCEEDED_CODE, LlmError } from '@deepseek-ai/dsh-llm'
+import type { Message } from '@deepseek-ai/dsh-llm'
 import { assertNever } from '@deepseek-ai/dsh-util-values'
 import type { Agent, PreStepDecision } from '@deepseek-ai/dsh-agent'
 import type { CommandId } from '@deepseek-ai/dsh-commands/types'
@@ -29,7 +30,7 @@ import {
   compactSurfaceRegion,
   selectCompactableRange,
 } from './region.ts'
-import { summarizeWithLlm } from './summarizer.ts'
+import { summarizeWithOverflowFallback } from './summarizer.ts'
 import type { SummarizationInput, SummaryResult, SummaryRoute } from './summarizer.ts'
 import type {
   BasicCompactionConfig,
@@ -63,10 +64,19 @@ function routedTarget(session: Session): SummaryRoute | undefined {
  * Output tokens the routed request reserves, which the provider charges to the
  * same window as the prompt. The effective envelope's own cap wins; otherwise
  * the adapter's per-request default, which the adapter materializes when that
- * envelope omits one. No declared cap means no reservation.
+ * envelope omits one; otherwise the configured `outputReserveTokens` fallback.
+ * No declared cap and no configured fallback means no reservation.
+ * @param header - the effective routed request envelope.
+ * @param defaultMaxTokens - adapter-reported per-request default, when known.
+ * @param fallbackReserve - configured reserve used when the adapter declares no cap.
+ * @returns output tokens to subtract from the message budget.
  */
-function reservedCompletionTokens(header: EpochHeader, defaultMaxTokens: number | undefined): number {
-  return header.config.maxTokens ?? defaultMaxTokens ?? 0
+function reservedCompletionTokens(
+  header: EpochHeader,
+  defaultMaxTokens: number | undefined,
+  fallbackReserve = 0,
+): number {
+  return header.config.maxTokens ?? defaultMaxTokens ?? fallbackReserve
 }
 
 /**
@@ -93,6 +103,7 @@ const summarizationModelSchema = z.string()
 const maxTokensSchema = z.number().step(1).min(1)
 const compactionRetriesSchema = z.number().step(1).min(0)
 const maxOverflowRetriesSchema = z.number().step(1).min(0)
+const outputReserveTokensSchema = z.number().step(1).min(0)
 
 const modelPolicy: z<ModelCompactPolicyConfig> = z.object({
   provider: z.string().required(),
@@ -106,6 +117,7 @@ const modelPolicy: z<ModelCompactPolicyConfig> = z.object({
   maxTokens: maxTokensSchema,
   compactionRetries: compactionRetriesSchema,
   maxOverflowRetries: maxOverflowRetriesSchema,
+  outputReserveTokens: outputReserveTokensSchema,
 })
 
 /**
@@ -129,6 +141,7 @@ export class BasicCompactionEngine extends CompactionEngine {
     maxTokens: maxTokensSchema,
     compactionRetries: compactionRetriesSchema,
     maxOverflowRetries: maxOverflowRetriesSchema,
+    outputReserveTokens: outputReserveTokensSchema,
     modelPolicies: z.array(modelPolicy),
     auto: z.boolean(),
   })
@@ -279,7 +292,11 @@ export class BasicCompactionEngine extends CompactionEngine {
    * Without a configured summary target the call goes to the route recorded
    * on the latest assistant message, then the latest request header, then the
    * agent options. A model selected for a later request is not used.
-   * Override this sole hook for a template or remote summarizer.
+   * When the provider rejects that call because the prefix itself no longer
+   * fits — or stops the summary at its output cap — the newest portion of the
+   * prefix is summarized instead, so an overflow-recovery compaction can still
+   * produce a checkpoint and continue the turn. Override this sole hook for a
+   * template or remote summarizer.
    * @param input - replayed conversation prefix (system, tools, and leading messages) to condense.
    * @param agent - supplies the session history, fallback model, and session id.
    * @param signal - optional cancellation forwarded to the adapter.
@@ -294,7 +311,28 @@ export class BasicCompactionEngine extends CompactionEngine {
     const config = target === undefined
       ? this.config
       : resolveTargetPolicy(this.config, target)
-    return summarizeWithLlm(this.ctx, config, input, agent, target, signal)
+    return summarizeWithOverflowFallback(
+      this.ctx,
+      config,
+      input,
+      agent,
+      target,
+      {
+        contextWindow: async (): Promise<number | undefined> => {
+          if (target === undefined) return undefined
+          try {
+            const info = await this.ctx.llm.resolveModelInfo(target.provider, target.model, signal)
+            return info.context?.contextWindow
+          } catch {
+            // Capacity is advisory for retry sizing; an adapter that cannot
+            // report it still retries at half the failing input.
+            return undefined
+          }
+        },
+        estimate: (message: Message): number => this.ctx.tokenMeter.estimateMessage(message),
+      },
+      signal,
+    )
   }
 
   /**
@@ -355,7 +393,7 @@ export class BasicCompactionEngine extends CompactionEngine {
     const spec = resolveCompactSpec(
       policy,
       info.context.contextWindow,
-      reservedCompletionTokens(header, info.defaultMaxTokens),
+      reservedCompletionTokens(header, info.defaultMaxTokens, policy.outputReserveTokens),
     )
     if (measurement.totalTokens < spec.thresholdTokens) return null
 

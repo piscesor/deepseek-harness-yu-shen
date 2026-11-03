@@ -5,7 +5,12 @@
  */
 
 import type { Context } from '@deepseek-ai/cordis'
-import { contentHasImage, BlockAssembler, LlmError } from '@deepseek-ai/dsh-llm'
+import {
+  contentHasImage,
+  CONTEXT_WINDOW_EXCEEDED_CODE,
+  BlockAssembler,
+  LlmError,
+} from '@deepseek-ai/dsh-llm'
 import { deepFreeze } from '@deepseek-ai/dsh-util-values'
 import type {
   ContentBlock, FinishReason, GenerateOptions, Message, RequestMessage, TokenUsage, ToolSchema,
@@ -176,6 +181,126 @@ export async function summarizeWithLlm(
     maxTokens: config.maxTokens,
     ...(assembler.usage === undefined ? {} : { usage: assembler.usage }),
   }
+}
+
+/** Failure classes a smaller summarization input can resolve. */
+const RETRYABLE_SUMMARY_CODES = new Set<string>([CONTEXT_WINDOW_EXCEEDED_CODE, 'MAX_TOKENS'])
+
+/** Upper bound on summarization attempts; every retry sends strictly less input. */
+const MAX_SUMMARY_ATTEMPTS = 4
+
+/** Smallest slice retained when an attempt shrinks; below this a checkpoint carries no signal. */
+const MIN_RETRY_SLICE_TOKENS = 2048
+
+/** Route-derived facts the retry loop needs in order to bound a retried input. */
+export interface SummaryRetryBudget {
+  /** Adapter-reported capacity of the summarization target, when the adapter knows it. */
+  contextWindow(): Promise<number | undefined>
+  /** Fixed-heuristic price of one message, matching the conversation meter. */
+  estimate(message: Message): number
+}
+
+/** The failure code carried by a summarization finish, when it has one. */
+function summaryFailureCode(error: unknown): string | undefined {
+  if (typeof error !== 'object' || error === null) return undefined
+  const code = (error as { code?: unknown }).code
+  return typeof code === 'string' ? code : undefined
+}
+
+/**
+ * Keep the system head plus the newest messages that fit one retry budget.
+ *
+ * The system message carries the conversation's durable framing and keeps the
+ * auxiliary call a prefix of the routed request, so it is never trimmed; the
+ * conversation is cut from its oldest end, which is exactly what a compaction
+ * checkpoint is supposed to absorb anyway.
+ * @param input - the summarization input that just failed.
+ * @param contextWindow - adapter capacity of the summarization target, when known.
+ * @param maxTokens - output cap reserved for the summary itself.
+ * @param estimate - fixed-heuristic message price, matching the conversation meter.
+ * @returns a strictly smaller input, or `undefined` when nothing can be removed.
+ */
+export function trimRetryInput(
+  input: SummarizationInput,
+  contextWindow: number | undefined,
+  maxTokens: number,
+  estimate: (message: Message) => number,
+): SummarizationInput | undefined {
+  const messages = [...input.messages]
+  const head = messages[0]?.role === 'system' ? messages.shift() : undefined
+  if (messages.length === 0) return undefined
+  const priced = messages.map(message => estimate(message))
+  const total = priced.reduce((sum, tokens) => sum + tokens, 0)
+  const headTokens = head === undefined ? 0 : estimate(head)
+  // Half the current input always fits the "strictly smaller" contract; the
+  // route capacity further bounds it so the retried request lands under the
+  // window instead of merely under the previous attempt.
+  const half = Math.floor(total / 2)
+  const capacity = contextWindow === undefined
+    ? half
+    : contextWindow - maxTokens - headTokens - MIN_RETRY_SLICE_TOKENS
+  const target = Math.max(Math.min(half, capacity), Math.min(half, MIN_RETRY_SLICE_TOKENS))
+  let kept = 0
+  let accumulated = 0
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    accumulated += priced[index] ?? 0
+    if (kept > 0 && accumulated > target) break
+    kept += 1
+  }
+  if (kept >= messages.length) return undefined
+  const tail = messages.slice(messages.length - kept)
+  return { ...input, messages: head === undefined ? tail : [head, ...tail] }
+}
+
+/**
+ * Summarize the replayed prefix, retrying with a smaller prefix when the
+ * provider rejects the auxiliary call for size or stops it at the output cap.
+ *
+ * Overflow recovery runs exactly when the conversation no longer fits, so a
+ * full-prefix summarization request can be rejected by the very window it is
+ * meant to relieve. Shrinking the input keeps the checkpoint — and therefore
+ * the turn — alive; the alternative is surfacing the original context-window
+ * failure and making the user start a new session.
+ * @param ctx - context providing the LLM service.
+ * @param config - resolved backend configuration.
+ * @param input - replayed conversation prefix (system, tools, and leading messages) to condense.
+ * @param agent - supplies routed-model history, fallback model, and session id.
+ * @param conversation - route used when `config` names no summary target; `undefined` when the conversation has none.
+ * @param budget - capacity and pricing for retry sizing.
+ * @param signal - optional cancellation forwarded to the adapter.
+ * @returns safe text-only summary blocks and the exact call envelope and output.
+ */
+export async function summarizeWithOverflowFallback(
+  ctx: Context,
+  config: SummaryConfig,
+  input: SummarizationInput,
+  agent: Agent,
+  conversation: SummaryRoute | undefined,
+  budget: SummaryRetryBudget,
+  signal?: AbortSignal,
+): Promise<SummaryResult> {
+  let current = input
+  let firstError: unknown
+  for (let attempt = 0; attempt < MAX_SUMMARY_ATTEMPTS; attempt += 1) {
+    try {
+      return await summarizeWithLlm(ctx, config, current, agent, conversation, signal)
+    } catch (error: unknown) {
+      firstError ??= error
+      const code = summaryFailureCode(error)
+      if (code === undefined || !RETRYABLE_SUMMARY_CODES.has(code) || signal?.aborted === true) {
+        throw error
+      }
+      const next = trimRetryInput(
+        current,
+        await budget.contextWindow(),
+        config.maxTokens,
+        message => budget.estimate(message),
+      )
+      if (next === undefined) throw firstError
+      current = next
+    }
+  }
+  throw firstError
 }
 
 /**

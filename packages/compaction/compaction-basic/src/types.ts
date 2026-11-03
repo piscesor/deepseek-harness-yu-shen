@@ -32,6 +32,13 @@ export interface CompactionPolicyConfig {
   compactionRetries?: number
   /** Maximum retries after canonical context overflow; `0` disables recovery. Defaults to `1`. */
   maxOverflowRetries?: number
+  /**
+   * Output tokens reserved when computing the pressure threshold, so compaction
+   * fires before input plus output would exceed the model's context window.
+   * Only used when the adapter does not report a wire-known `defaultMaxTokens`.
+   * Defaults to `32768`.
+   */
+  outputReserveTokens?: number
 }
 
 /** Exact provider/model override merged over the default compaction policy. */
@@ -64,6 +71,7 @@ interface ResolvedPolicyFields {
   readonly maxTokens: number
   readonly compactionRetries: number
   readonly maxOverflowRetries: number
+  readonly outputReserveTokens: number
 }
 
 /** Validated immutable config whose target-specific defaults remain unresolved. */

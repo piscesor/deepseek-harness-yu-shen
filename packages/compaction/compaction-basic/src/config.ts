@@ -22,6 +22,14 @@ const DEFAULT_THRESHOLD_RATIO = 0.8
 /** Default verbatim-tail fraction for every routed model. */
 const DEFAULT_RETAIN_RATIO = 0.16
 
+/**
+ * Default output-token reserve when the adapter reports no wire-known
+ * generation cap. Zero preserves the historical `thresholdRatio`-only trigger;
+ * a target that needs headroom for a large output budget opts in explicitly, or
+ * gets the adapter-reported `defaultMaxTokens`.
+ */
+const DEFAULT_OUTPUT_RESERVE_TOKENS = 0
+
 /** Fields shared by top-level defaults and exact-target overrides. */
 const POLICY_CONFIG_KEYS = [
   'thresholdRatio',
@@ -33,6 +41,7 @@ const POLICY_CONFIG_KEYS = [
   'maxTokens',
   'compactionRetries',
   'maxOverflowRetries',
+  'outputReserveTokens',
 ] as const
 
 /** Complete public top-level configuration key set. */
@@ -104,6 +113,7 @@ export function resolveConfig(config: BasicCompactionConfig = {}): ResolvedConfi
     maxTokens,
     compactionRetries: config.compactionRetries ?? 1,
     maxOverflowRetries: config.maxOverflowRetries ?? 1,
+    outputReserveTokens: config.outputReserveTokens ?? DEFAULT_OUTPUT_RESERVE_TOKENS,
     modelPolicies,
     auto: config.auto ?? true,
   })
@@ -135,6 +145,7 @@ export function resolveTargetPolicy(
     maxTokens: override?.maxTokens ?? config.maxTokens,
     compactionRetries: override?.compactionRetries ?? config.compactionRetries,
     maxOverflowRetries: override?.maxOverflowRetries ?? config.maxOverflowRetries,
+    outputReserveTokens: override?.outputReserveTokens ?? config.outputReserveTokens,
   })
 }
 
@@ -213,6 +224,7 @@ export function resolveCompactSpec(
     maxTokens: policy.maxTokens,
     compactionRetries: policy.compactionRetries,
     maxOverflowRetries: policy.maxOverflowRetries,
+    outputReserveTokens: reservedCompletionTokens,
   })
 }
 
@@ -285,6 +297,7 @@ function validatePolicy(
   const maxTokens = config.maxTokens
   const compactionRetries = config.compactionRetries
   const maxOverflowRetries = config.maxOverflowRetries
+  const outputReserveTokens = config.outputReserveTokens
   if (thresholdRatio !== undefined) assertRatio(`${name}.thresholdRatio`, thresholdRatio)
   if (headroomTokens !== undefined) assertNonNegativeInteger(`${name}.headroomTokens`, headroomTokens)
   if (retainRatio !== undefined) assertRatio(`${name}.retainRatio`, retainRatio)
@@ -298,6 +311,9 @@ function validatePolicy(
   }
   if (maxOverflowRetries !== undefined) {
     assertNonNegativeInteger(`${name}.maxOverflowRetries`, maxOverflowRetries)
+  }
+  if (outputReserveTokens !== undefined) {
+    assertNonNegativeInteger(`${name}.outputReserveTokens`, outputReserveTokens)
   }
 
   validateSummarizationPair(config, name)

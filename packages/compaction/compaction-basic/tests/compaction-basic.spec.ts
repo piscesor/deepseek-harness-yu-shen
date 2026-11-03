@@ -1,11 +1,11 @@
-import { describe, expect, expectTypeOf, it, onTestFinished, vi } from 'vitest'
+﻿import { describe, expect, expectTypeOf, it, onTestFinished, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import type { AttachmentId } from '@deepseek-ai/dsh-attachment/types'
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
 import type { BasicCompactionConfig } from '@deepseek-ai/dsh-compaction-basic'
 import { selectCompactableRange } from '@deepseek-ai/dsh-compaction-basic/src/region.ts'
 import { answeredRouteProjectionDefinition } from '@deepseek-ai/dsh-compaction-basic/src/answered-route.ts'
-import { frameSummary } from '@deepseek-ai/dsh-compaction-basic/src/summarizer.ts'
+import { frameSummary, trimRetryInput } from '@deepseek-ai/dsh-compaction-basic/src/summarizer.ts'
 import type { SummarizationInput, SummaryResult } from '@deepseek-ai/dsh-compaction-basic/src/summarizer.ts'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { CompactionId } from '@deepseek-ai/dsh-compaction/types'
@@ -324,6 +324,7 @@ describe('compact configuration and defaults', () => {
       maxTokens: 65_536,
       compactionRetries: 1,
       maxOverflowRetries: 1,
+      outputReserveTokens: 0,
       modelPolicies: [],
       auto: true,
     })
@@ -2655,5 +2656,151 @@ describe('route-priced image pressure', () => {
       .filter(node => result?.shadowedSeqs.includes(node.seq))
       .reduce((total, node) => total + node.heuristicTokens, 0)
     expect(summaryEvent?.data.shadowedTokenCount).toBe(shadowedHeuristic)
+  })
+})
+
+/**
+ * Adapter that behaves like a provider window: an auxiliary request above the
+ * message budget fails with the provider's own overflow wording, and a
+ * response that hits the output cap ends with `max-tokens` instead of `stop`.
+ */
+class WindowLimitedAdapter extends LlmAdapter {
+  readonly calls: Message[][] = []
+
+  constructor(
+    private readonly maxMessages: number,
+    private readonly truncateFirst: boolean = false,
+  ) {
+    super()
+  }
+
+  override resolveModel(provider: string, model: string): Promise<LlmResolvedModelInfo> {
+    return Promise.resolve({
+      provider,
+      id: model,
+      name: model,
+      context: { contextWindow: 65_536 },
+    })
+  }
+
+  override async * stream(options: GenerateOptions): AsyncIterable<StreamChunk> {
+    this.calls.push([...options.messages])
+    if (options.messages.length > this.maxMessages) {
+      yield {
+        type: 'finish',
+        reason: {
+          kind: 'error',
+          failure: {
+            message: '400: {"code":400,"message":"request (66033 tokens) exceeds the available context size '
+              + '(65536 tokens), try increasing it","type":"exceed_context_size_error"}',
+            code: CONTEXT_WINDOW_EXCEEDED_CODE,
+          },
+        },
+      }
+      return
+    }
+    if (this.truncateFirst && this.calls.length === 1) {
+      yield { type: 'finish', reason: { kind: 'max-tokens' } }
+      return
+    }
+    yield { type: 'block-start', index: 0, blockType: 'text' }
+    yield { type: 'text-delta', index: 0, text: 'summary' }
+    yield { type: 'finish', reason: { kind: 'stop' } }
+  }
+}
+
+/** Build the sole-hook engine over a window-limited adapter. */
+async function windowHarness(adapter: LlmAdapter): Promise<ExposedCompactionEngine> {
+  const ctx = new Context()
+  await ctx.plugin(LlmRuntime)
+  await ctx.plugin(SessionProjectionRegistry)
+  void new TokenMeter(ctx)
+  ctx.llm.registerAdapter([MODEL], adapter)
+  return new ExposedCompactionEngine(ctx, {
+    auto: false,
+    summarizationProvider: MODEL,
+    summarizationModel: MODEL,
+  })
+}
+
+/** A replayed prefix of one system head and `count` same-sized user messages. */
+function longPrefix(count: number): SummarizationInput {
+  return {
+    messages: [
+      createSystemMessage('durable system head'),
+      ...Array.from({ length: count }, (_, index) => createUserMessage({
+        content: [{ type: 'text', text: `turn ${index} ${'payload '.repeat(40)}` }],
+        source: { kind: 'plugin', plugin: 'test' },
+      })),
+    ],
+  }
+}
+
+describe('summarizer overflow fallback', () => {
+  it('retries an over-window auxiliary request with the newest fitting slice', async () => {
+    const adapter = new WindowLimitedAdapter(4)
+    const compact = await windowHarness(adapter)
+    const session = conversation(1)
+    const input = longPrefix(12)
+
+    const output = await compact.runSummarize(input, agent(session, MODEL), SIGNAL)
+
+    expect(output.summary).toEqual([{ type: 'text', text: 'summary' }])
+    expect(adapter.calls.length).toBeGreaterThan(1)
+    const first = adapter.calls[0] ?? []
+    const last = adapter.calls.at(-1) ?? []
+    expect(first.length).toBe(input.messages.length + 1)
+    expect(last.length).toBeLessThanOrEqual(4)
+    // The durable system head survives every retry; only history is dropped.
+    expect(last[0]).toMatchObject({ role: 'system' })
+    expect(last.at(-1)).toMatchObject({ role: 'user' })
+  })
+
+  it('retries a summary truncated at the output cap with a smaller prefix', async () => {
+    const adapter = new WindowLimitedAdapter(Number.MAX_SAFE_INTEGER, true)
+    const compact = await windowHarness(adapter)
+    const session = conversation(1)
+    const input = longPrefix(6)
+
+    const output = await compact.runSummarize(input, agent(session, MODEL), SIGNAL)
+
+    expect(output.summary).toEqual([{ type: 'text', text: 'summary' }])
+    expect(adapter.calls.length).toBe(2)
+    const last = adapter.calls.at(-1) ?? []
+    expect(last.length).toBeLessThan(adapter.calls[0]?.length ?? 0)
+    expect(last[0]).toMatchObject({ role: 'system' })
+  })
+
+  it('keeps the system head and drops only the oldest history', () => {
+    const estimate = (message: Message): number =>
+      message.content.reduce((total, block) =>
+        total + (block.type === 'text' ? block.text.length : 0), 0)
+    const trimmed = trimRetryInput(longPrefix(8), 65_536, 8_192, estimate)
+    expect(trimmed).toBeDefined()
+    expect(trimmed?.messages[0]).toMatchObject({ role: 'system' })
+    expect(trimmed?.messages.length).toBeLessThan(9)
+    expect(estimate(trimmed?.messages.at(-1) as Message)).toBeGreaterThan(0)
+  })
+
+  it('reports no smaller input when only the system head remains', () => {
+    const estimate = (message: Message): number =>
+      message.content.reduce((total, block) =>
+        total + (block.type === 'text' ? block.text.length : 0), 0)
+    const systemOnly = { messages: [createSystemMessage('head')] }
+    expect(trimRetryInput(systemOnly, 65_536, 8_192, estimate)).toBeUndefined()
+  })
+})
+
+describe('overflow recovery with a full window', () => {
+  it('still lands a checkpoint when the summarization request itself overflows', async () => {
+    const adapter = new WindowLimitedAdapter(4)
+    const compact = await windowHarness(adapter)
+    const session = conversation(6)
+
+    const result = await compact.compactIfNeeded(agent(session, MODEL), 'context-overflow', SIGNAL)
+
+    expect(result).not.toBeNull()
+    expect(session.snapshotEvents().filter(event => event.type === 'compaction/summary')).toHaveLength(1)
+    expect(adapter.calls.length).toBeGreaterThan(1)
   })
 })

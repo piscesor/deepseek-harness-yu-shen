@@ -8,7 +8,7 @@ import type { LlmCallConfig } from '@deepseek-ai/dsh-llm'
 
 /** Policy fields shared by the default policy and exact model overrides. */
 export interface CompactionPolicyConfig {
-  /** Compact at this fraction of the model's context window. Defaults to `0.8`. */
+  /** Compact at this fraction of the model's context window, also capped by the window minus reserved output tokens. Defaults to `0.8`. */
   thresholdRatio?: number
   /** Recent context retained as a fraction of the model's window. Defaults to `0.16`. */
   retainRatio?: number
@@ -24,6 +24,13 @@ export interface CompactionPolicyConfig {
   compactionRetries?: number
   /** Maximum retries after canonical context overflow; `0` disables recovery. Defaults to `1`. */
   maxOverflowRetries?: number
+  /**
+   * Output tokens reserved when computing the pressure threshold, so compaction
+   * fires before input plus output would exceed the model's context window.
+   * Only used when the adapter does not report a wire-known `defaultMaxTokens`.
+   * Defaults to `32768`.
+   */
+  outputReserveTokens?: number
 }
 
 /** Exact provider/model override merged over the default compaction policy. */
@@ -55,6 +62,7 @@ interface ResolvedPolicyFields {
   readonly maxTokens: number
   readonly compactionRetries: number
   readonly maxOverflowRetries: number
+  readonly outputReserveTokens: number
 }
 
 /** Validated immutable config whose target-specific defaults remain unresolved. */

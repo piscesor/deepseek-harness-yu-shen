@@ -30,6 +30,15 @@ interface ReferencedSteeringMessageNode extends SteeringMessageNode {
 
 type MessageNode = ReferencedUserMessageNode | ReferencedSteeringMessageNode | (ContextMessageNode & { readonly waking?: boolean })
 
+const AUTO_CONTINUE_PLUGIN = '@deepseek-ai/dsh-auto-continue'
+
+/** Whether a context message was injected by the loop's own continuation plugin. */
+function isAutoContinueSource(source: unknown): boolean {
+  if (typeof source !== 'object' || source === null) return false
+  const candidate = source as { kind?: unknown; plugin?: unknown }
+  return candidate.kind === 'plugin' && candidate.plugin === AUTO_CONTINUE_PLUGIN
+}
+
 declare module '../contract/chat-nodes.ts' {
   interface ChatNodeDataMap {
     /** Ordinary turn-opening user message. */
@@ -148,12 +157,20 @@ export const messageDefinition: ConversationNodeDefinition<MessageNode> = {
     // later steering stay in the current exchange, so they never fold earlier Turns.
     const human = context.state.kind === 'user' || context.state.kind === 'steering'
     const opensExchange = human && location.kind === 'step' && location.step.step === 1
+    // A continuation injected by the auto-continue plugin is durable for replay
+    // but is not something the user wrote, so the chat client hides it.
+    const hidden = context.state.kind === 'context'
+      && isAutoContinueSource(context.state.source)
     return chatNode(
       context,
       waking ? 'turn-trigger' : context.state.kind,
       context.state.seq,
       context.state,
-      { location, groupTree: opensExchange ? 'exchange' : (human || waking) ? 'input' : undefined },
+      {
+        location,
+        groupTree: opensExchange ? 'exchange' : (human || waking) ? 'input' : undefined,
+        ...(hidden ? { visibility: 'hidden' } : {}),
+      },
     )
   },
 }

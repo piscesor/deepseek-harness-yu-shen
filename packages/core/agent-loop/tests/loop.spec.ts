@@ -1,4 +1,4 @@
-import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
+﻿import * as NativeToolExecutor from '@deepseek-ai/dsh-tool-executor-native'
 import { describe, expect, it, onTestFinished, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import { brandString } from '@deepseek-ai/dsh-brand'
@@ -1480,7 +1480,7 @@ describe('agent loop', () => {
         id: expect.any(String) as unknown,
         role: 'user',
         content: [{ type: 'text', text: 'Continue the previous assistant response exactly where it was truncated. Do not repeat any text that has already been sent; finish the response.' }],
-        source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-auto-continue' },
+        source: { kind: 'auto-continue' },
       },
     ])
     expect(reasons).toEqual([{ kind: 'completed' }])
@@ -1700,7 +1700,7 @@ describe('agent loop', () => {
         id: expect.any(String) as unknown,
         role: 'user',
         content: [{ type: 'text', text: 'Continue the previous assistant response exactly where it was truncated. Do not repeat any text that has already been sent; finish the response.' }],
-        source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-auto-continue' },
+        source: { kind: 'auto-continue' },
       },
       {
         id: expect.any(String) as unknown,

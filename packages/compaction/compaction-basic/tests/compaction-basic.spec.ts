@@ -1,4 +1,4 @@
-﻿import { describe, expect, expectTypeOf, it, onTestFinished, vi } from 'vitest'
+import { describe, expect, expectTypeOf, it, onTestFinished, vi } from 'vitest'
 import { Context } from '@deepseek-ai/cordis'
 import type { AttachmentId } from '@deepseek-ai/dsh-attachment/types'
 import BasicCompactionEngine from '@deepseek-ai/dsh-compaction-basic'
@@ -2665,7 +2665,7 @@ describe('route-priced image pressure', () => {
  * response that hits the output cap ends with `max-tokens` instead of `stop`.
  */
 class WindowLimitedAdapter extends LlmAdapter {
-  readonly calls: Message[][] = []
+  readonly calls: GenerateOptions['messages'][] = []
 
   constructor(
     private readonly maxMessages: number,
@@ -2730,7 +2730,7 @@ function longPrefix(count: number): SummarizationInput {
       createSystemMessage('durable system head'),
       ...Array.from({ length: count }, (_, index) => createUserMessage({
         content: [{ type: 'text', text: `turn ${index} ${'payload '.repeat(40)}` }],
-        source: { kind: 'plugin', plugin: 'test' },
+        source: { kind: 'user' },
       })),
     ],
   }

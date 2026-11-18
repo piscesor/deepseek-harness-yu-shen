@@ -787,7 +787,7 @@ export interface Config {
 ## `@deepseek-ai/dsh-compaction-basic`
 
 - `inject`: `llm` · `tokenMeter` · `sessions` · `sessionProjections`
-- `source`: [`packages/compaction/compaction-basic/src/types.ts:46`](../packages/compaction/compaction-basic/src/types.ts)
+- `source`: [`packages/compaction/compaction-basic/src/types.ts:53`](../packages/compaction/compaction-basic/src/types.ts)
 
 ```ts config-catalog
 /** Basic compaction configuration with an optional exact-target policy table. */
@@ -818,6 +818,13 @@ export interface CompactionPolicyConfig {
   compactionRetries?: number
   /** Maximum retries after canonical context overflow; `0` disables recovery. Defaults to `1`. */
   maxOverflowRetries?: number
+  /**
+   * Output tokens reserved when computing the pressure threshold, so compaction
+   * fires before input plus output would exceed the model's context window.
+   * Only used when the adapter does not report a wire-known `defaultMaxTokens`.
+   * Defaults to `32768`.
+   */
+  outputReserveTokens?: number
 }
 
 /** Exact provider/model override merged over the default compaction policy. */

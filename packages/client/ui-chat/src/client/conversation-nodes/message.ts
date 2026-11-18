@@ -30,13 +30,10 @@ interface ReferencedSteeringMessageNode extends SteeringMessageNode {
 
 type MessageNode = ReferencedUserMessageNode | ReferencedSteeringMessageNode | (ContextMessageNode & { readonly waking?: boolean })
 
-const AUTO_CONTINUE_PLUGIN = '@deepseek-ai/dsh-auto-continue'
-
-/** Whether a context message was injected by the loop's own continuation plugin. */
+/** Whether one source marks a continuation the agent loop queued itself. */
 function isAutoContinueSource(source: unknown): boolean {
   if (typeof source !== 'object' || source === null) return false
-  const candidate = source as { kind?: unknown; plugin?: unknown }
-  return candidate.kind === 'plugin' && candidate.plugin === AUTO_CONTINUE_PLUGIN
+  return (source as { kind?: unknown }).kind === 'auto-continue'
 }
 
 declare module '../contract/chat-nodes.ts' {

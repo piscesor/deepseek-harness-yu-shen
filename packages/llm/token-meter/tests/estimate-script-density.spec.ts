@@ -7,12 +7,10 @@ import {
   estimateTextTokens,
 } from '../src/estimate.ts'
 
-const PLUGIN = '@deepseek-ai/dsh-system-prompt'
-
 function textInput(text: string) {
   return createUserMessage({
     content: [{ type: 'text', text }],
-    source: { kind: 'plugin', plugin: 'test' },
+    source: { kind: 'user' },
   })
 }
 
@@ -47,7 +45,7 @@ describe('script-aware text density', () => {
 
   it('routes system and user messages through the same density', () => {
     const chinese = '继续实现这个功能。'
-    expect(estimateSystemMessage(createSystemMessage(chinese, PLUGIN))).toBe(estimateTextTokens(chinese) + 4)
+    expect(estimateSystemMessage(createSystemMessage(chinese))).toBe(estimateTextTokens(chinese) + 4)
     expect(estimateMessage(textInput(chinese))).toBe(estimateTextTokens(chinese) + 4 + 4)
   })
 })

@@ -51,12 +51,24 @@ interface LoopProjections {
   readonly inbox: () => InboxState
 }
 
+/** Source of the invisible continuation message the loop injects after truncation. */
+interface AutoContinueMessageSource {
+  /** Discriminator for a continuation this loop queued itself. */
+  kind: 'auto-continue'
+}
+
+declare module '@deepseek-ai/dsh-llm' {
+  interface MessageSourceMap {
+    'auto-continue': AutoContinueMessageSource
+  }
+}
+
 /**
  * A bounded guard against models that stop only because their response hit the
  * provider output limit. The message is durable for replay and hidden by the
  * chat client so the continuation stays invisible to the user.
  */
-const AUTO_CONTINUE_PLUGIN = '@deepseek-ai/dsh-auto-continue'
+const AUTO_CONTINUE_SOURCE: AutoContinueMessageSource = { kind: 'auto-continue' }
 const AUTO_CONTINUE_PROMPT = 'Continue the previous assistant response exactly where it was truncated. Do not repeat any text that has already been sent; finish the response.'
 const MAX_AUTO_CONTINUATIONS_PER_TURN = 8
 
@@ -424,7 +436,7 @@ export class ReactLoopAgent implements Agent {
           automaticContinuations += 1
           this.inbox.splice('next-step', 0, 0, [createUserMessage({
             content: [{ type: 'text', text: AUTO_CONTINUE_PROMPT }],
-            source: { kind: 'plugin', plugin: AUTO_CONTINUE_PLUGIN },
+            source: AUTO_CONTINUE_SOURCE,
           })])
           // This truncation has a scheduled recovery step. Only expose a
           // max-tokens turn ending if every bounded retry is exhausted.

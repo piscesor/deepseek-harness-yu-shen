@@ -23,6 +23,15 @@ interface ReferencedSteeringMessageNode extends SteeringMessageNode {
 
 type MessageNode = ReferencedUserMessageNode | ReferencedSteeringMessageNode | ContextMessageNode
 
+const AUTO_CONTINUE_PLUGIN = '@deepseek-ai/dsh-auto-continue'
+
+/** Whether a context message was injected by the loop's own continuation plugin. */
+function isAutoContinueSource(source: unknown): boolean {
+  if (typeof source !== 'object' || source === null) return false
+  const candidate = source as { kind?: unknown; plugin?: unknown }
+  return candidate.kind === 'plugin' && candidate.plugin === AUTO_CONTINUE_PLUGIN
+}
+
 declare module '../contract/chat-nodes.ts' {
   interface ChatNodeDataMap {
     /** Ordinary turn-opening user message. */
@@ -85,7 +94,11 @@ export const messageDefinition: ConversationNodeDefinition<MessageNode> = {
   update: context => context.state,
   buildViewNode: (context) => {
     if (context.state === undefined) return null
-    return chatNode(context, context.state.kind, context.state.seq, context.state)
+    const hidden = context.state.kind === 'context'
+      && isAutoContinueSource(context.state.source)
+    return chatNode(context, context.state.kind, context.state.seq, context.state, {
+      ...(hidden ? { visibility: 'hidden' } : {}),
+    })
   },
 }
 

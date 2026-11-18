@@ -1287,10 +1287,11 @@ describe('agent loop', () => {
     })
   })
 
-  it('surfaces max-tokens as the turn-end reason when the last step is cut off', async () => {
-    // A single step that ends with a max-tokens finish (no tool calls): the
-    // turn stops by default and ends max-tokens, not completed.
-    const adapter = new MockAdapter([maxTokensResponse('truncat')])
+  it('surfaces max-tokens only after bounded automatic continuations are exhausted', async () => {
+    const adapter = new MockAdapter(Array.from(
+      { length: 9 },
+      (_unused, index) => maxTokensResponse(`truncat ${index}`),
+    ))
     const ctx = await harness(adapter)
     const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
@@ -1300,16 +1301,14 @@ describe('agent loop', () => {
     send(agent, 'go')
     await waitForIdle(ctx, agent)
 
-    expect(adapter.requests).toHaveLength(1)
+    expect(adapter.requests).toHaveLength(9)
     expect(reasons).toEqual([{ kind: 'max-tokens' }])
     // Assert the durable row, not only the live listener.
     const turnEnd = agent.session.snapshotEvents().findLast(e => e.type === 'turn/end')
     expect(turnEnd!.data.reason).toEqual({ kind: 'max-tokens' })
   })
 
-  it('a max-tokens step earlier in a turn still surfaces as max-tokens after a later completed step', async () => {
-    // Step 1 is cut off (max-tokens, no tool calls → would stop by default), so continuation
-    // must be FORCED to reach step 2 which finishes normally (stop).
+  it('automatically continues a max-tokens step and completes the same turn', async () => {
     const adapter = new MockAdapter([
       maxTokensResponse('first half'),
       textResponse('second half'),
@@ -1317,23 +1316,12 @@ describe('agent loop', () => {
     const ctx = await harness(adapter)
     const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
-    let steps = 0
-    ctx.on('session/event', (_session, event) => { if (event.type === 'step/end') steps++ })
-    // Force exactly one continuation (step 1 → step 2), then defer to default
-    // (step 2 is a plain stop with no tool calls → stops).
-    ctx.on('agent/turn-stopping', ({ agent: subject }) => {
-      if (steps < 2) {
-        subject.steer(createUserMessage({ content: [{ type: 'text', text: 'continue after truncation' }], source: { kind: 'plugin', plugin: 'max-tokens-test' } }))
-      }
-    })
-
     const reasons: TurnEndReason[] = []
     ctx.on('session/event', (_s, event) => { if (event.type === 'turn/end') reasons.push(event.data.reason) })
 
     send(agent, 'go')
     await waitForIdle(ctx, agent)
 
-    expect(steps).toBe(2)
     expect(adapter.requests).toHaveLength(2)
     expect(adapter.requests[1]!.messages.slice(1)).toEqual([
       {
@@ -1351,19 +1339,15 @@ describe('agent loop', () => {
       {
         id: expect.any(String) as unknown,
         role: 'user',
-        content: [{ type: 'text', text: 'continue after truncation' }],
-        source: { kind: 'plugin', plugin: 'max-tokens-test' },
+        content: [{ type: 'text', text: 'Continue the previous assistant response exactly where it was truncated. Do not repeat any text that has already been sent; finish the response.' }],
+        source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-auto-continue' },
       },
     ])
-    // A max-token step is sticky: the later completed step must not
-    // downgrade the turn outcome.
-    expect(reasons).toEqual([{ kind: 'max-tokens' }])
+    expect(reasons).toEqual([{ kind: 'completed' }])
   })
 
-  it('a completed step after no max-tokens keeps the turn completed (max-tokens does not leak across turns)', async () => {
-    // Two consecutive turns: turn 1 is cut off (max-tokens), turn 2 is a clean
-    // stop. The per-turn reason must be independent — turn 2 ends completed.
-    const adapter = new MockAdapter([maxTokensResponse('cut'), textResponse('clean')])
+  it('does not leak automatic continuation state across turns', async () => {
+    const adapter = new MockAdapter([maxTokensResponse('cut'), textResponse('continued'), textResponse('clean')])
     const ctx = await harness(adapter)
     const agent = await ctx.agentLoop.create(SessionId('a1'), { provider: 'mock', model: 'mock' })
 
@@ -1375,7 +1359,7 @@ describe('agent loop', () => {
     send(agent, 'second')
     await waitForIdle(ctx, agent)
 
-    expect(reasons).toEqual([{ kind: 'max-tokens' }, { kind: 'completed' }])
+    expect(reasons).toEqual([{ kind: 'completed' }, { kind: 'completed' }])
   })
 
   it('does not dispatch tool calls from a max-tokens-truncated step', async () => {
@@ -1386,7 +1370,7 @@ describe('agent loop', () => {
       { type: 'block-end', index: 0, block: { type: 'tool-call', id: callId, name: 'echo', arguments: '{"text":"x"}' } },
       { type: 'usage', usage: { inputTokens: 10, outputTokens: 5 } },
       { type: 'finish', reason: { kind: 'max-tokens' } },
-    ]])
+    ], textResponse('resumed')])
     const ctx = await harness(adapter)
     let executions = 0
     ctx.tools.register(defineContentToolFixture({
@@ -1408,13 +1392,19 @@ describe('agent loop', () => {
 
     expect(executions).toBe(0)
     expect(agent.session.snapshotEvents().some(e => e.type === 'tool/call')).toBe(false)
-    expect(agent.session.deriveMessages().slice(1)).toEqual([{
+    expect(agent.session.deriveMessages()).toContainEqual({
       id: expect.any(String) as unknown,
       role: 'user',
       content: [{ type: 'text', text: 'go' }],
       source: { kind: 'user' },
-    }])
-    expect(reasons).toEqual([{ kind: 'max-tokens' }])
+    })
+    expect(agent.session.deriveMessages()).toContainEqual({
+      id: expect.any(String) as unknown,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'resumed' }],
+      source: { kind: 'model', provider: 'mock', model: 'mock' },
+    })
+    expect(reasons).toEqual([{ kind: 'completed' }])
     // Empty content still needs an assistant/message to carry usage; derivation
     // skips that host so it does not create a spurious assistant turn.
     const assistantMessage = agent.session.snapshotEvents().find(e => e.type === 'assistant/message')
@@ -1440,7 +1430,7 @@ describe('agent loop', () => {
       { type: 'tool-call-delta', index: 0, id: callId, name: 'echo', argumentsDelta: '{"text":"x"}' },
       { type: 'block-end', index: 0, block: { type: 'tool-call', id: callId, name: 'echo', arguments: '{"text":"x"}' } },
       { type: 'finish', reason: { kind: 'max-tokens' } },
-    ]])
+    ], textResponse('resumed')])
     const ctx = await harness(adapter)
     ctx.tools.register(defineContentToolFixture({
       name: 'echo',
@@ -1456,7 +1446,7 @@ describe('agent loop', () => {
     send(agent, 'go')
     await waitForIdle(ctx, agent)
 
-    expect(reasons).toEqual([{ kind: 'max-tokens' }])
+    expect(reasons).toEqual([{ kind: 'completed' }])
     const assistant = agent.session.snapshotEvents().find(e => e.type === 'assistant/message')!
     expect(assistant.type === 'assistant/message' && assistant.data).toMatchObject({
       turn: 1,
@@ -1470,12 +1460,18 @@ describe('agent loop', () => {
     })
     expect(assistant.sourceEventSeqs).toBeUndefined()
     expect(assistant.type === 'assistant/message' ? assistant.data.stream.length : 0).toBeGreaterThan(0)
-    expect(agent.session.deriveMessages().slice(1)).toEqual([{
+    expect(agent.session.deriveMessages()).toContainEqual({
       id: expect.any(String) as unknown,
       role: 'user',
       content: [{ type: 'text', text: 'go' }],
       source: { kind: 'user' },
-    }])
+    })
+    expect(agent.session.deriveMessages()).toContainEqual({
+      id: expect.any(String) as unknown,
+      role: 'assistant',
+      content: [{ type: 'text', text: 'resumed' }],
+      source: { kind: 'model', provider: 'mock', model: 'mock' },
+    })
   })
 
   it('appends an empty completion anchor for a normal stop with no usage', async () => {
@@ -1532,8 +1528,6 @@ describe('agent loop', () => {
 
     send(agent, 'go')
     await waitForIdle(ctx, agent)
-    send(agent, 'continue')
-    await waitForIdle(ctx, agent)
 
     expect(agent.session.snapshotEvents().some(e => e.type === 'tool/call')).toBe(false)
     // The follow-up request replays the truncated message with its replay
@@ -1565,8 +1559,8 @@ describe('agent loop', () => {
       {
         id: expect.any(String) as unknown,
         role: 'user',
-        content: [{ type: 'text', text: 'continue' }],
-        source: { kind: 'user' },
+        content: [{ type: 'text', text: 'Continue the previous assistant response exactly where it was truncated. Do not repeat any text that has already been sent; finish the response.' }],
+        source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-auto-continue' },
       },
       {
         id: expect.any(String) as unknown,

@@ -20,6 +20,7 @@ import type { GenerateOptions, LlmCallConfig, Message, PreparedLlmCall } from '@
 import {
   LlmError,
   createAssistantMessage,
+  createUserMessage,
   errorChain,
   markAgentLoopRequest,
 } from '@deepseek-ai/dsh-llm'
@@ -37,6 +38,15 @@ import { RuntimeContextProjection } from './runtime-context.ts'
 import { AssistantStreamAttempt } from './assistant-stream.ts'
 import { SystemPromptProjection } from './runtime-context.ts'
 import { executeToolCalls } from './tool-calls.ts'
+
+/**
+ * A bounded guard against models that stop only because their response hit the
+ * provider output limit. The message is durable for replay and hidden by the
+ * chat client so the continuation stays invisible to the user.
+ */
+const AUTO_CONTINUE_PLUGIN = '@deepseek-ai/dsh-auto-continue'
+const AUTO_CONTINUE_PROMPT = 'Continue the previous assistant response exactly where it was truncated. Do not repeat any text that has already been sent; finish the response.'
+const MAX_AUTO_CONTINUATIONS_PER_TURN = 8
 
 type Phase =
   | { kind: 'idle'; lastTurn: number }
@@ -281,6 +291,7 @@ export class ReactLoopAgent implements Agent {
     }
     phase.turn = turn
     let turnEnds: TurnEndReason | null = null
+    let automaticContinuations = 0
     let target: InboxTarget = 'next-turn'
     try {
       while (true) {
@@ -301,13 +312,15 @@ export class ReactLoopAgent implements Agent {
         signal.throwIfAborted()
         this.session.append('step/start', { turn, step })
         phase.step = step
+        let shouldAutoContinue = false
         try {
-          // max-tokens is sticky: once any step hits the ceiling, later steps
-          // that complete normally must not downgrade the turn outcome.
           const stepEnd = await this.step(decision)
-          // max-tokens stays sticky: a later completed step must not
-          // downgrade the turn outcome.
-          if (turnEnds === null || turnEnds.kind !== 'max-tokens') turnEnds = stepEnd
+          shouldAutoContinue = stepEnd?.kind === 'max-tokens'
+          if (turnEnds === null || turnEnds.kind !== 'max-tokens') {
+            // A user or plugin continuation deliberately queued by another
+            // caller retains the existing sticky max-tokens semantics.
+            turnEnds = stepEnd
+          }
         } finally {
           this.session.append('step/end', { turn, step })
         }
@@ -315,6 +328,19 @@ export class ReactLoopAgent implements Agent {
         if (turnEnds && this.inbox.nextStep.length === 0) {
           await this.dispatch.serial('agent/turn-stopping', { turn, signal })
           signal.throwIfAborted()
+        }
+        if (shouldAutoContinue
+          && turnEnds?.kind === 'max-tokens'
+          && this.inbox.nextStep.length === 0
+          && automaticContinuations < MAX_AUTO_CONTINUATIONS_PER_TURN) {
+          automaticContinuations += 1
+          this.inbox.splice('next-step', 0, 0, [createUserMessage({
+            content: [{ type: 'text', text: AUTO_CONTINUE_PROMPT }],
+            source: { kind: 'plugin', plugin: AUTO_CONTINUE_PLUGIN },
+          })])
+          // This truncation has a scheduled recovery step. Only expose a
+          // max-tokens turn ending if every bounded retry is exhausted.
+          turnEnds = null
         }
         if (turnEnds && this.inbox.nextStep.length === 0) break
         target = 'next-step'
